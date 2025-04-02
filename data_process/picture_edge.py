@@ -197,8 +197,3 @@ def process_contour_to_segments(image_path):
         print(f"Segment {i+1} Chain Code: {chain[:10]}... (length: {len(chain)})")
 
     return segments, chain_codes
-
-# 使用示例
-if __name__ == "__main__":
-    image_path = r"C:\Users\28489\Desktop\paired\23\2.jpg"
-    segments, chain_codes = process_contour_to_segments(image_path)
