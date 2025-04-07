@@ -12,17 +12,19 @@ class GraphNode:
     def __init__(
         self,
         node_id: int,
-        freeman_codes: Dict[str, List[int]],  # 四个方向的Freeman编码，改为E1-E4
-        centroid: Tuple[float, float],       # 质心位置 (x, y)
+        freeman_codes: Dict[str, List[int]],  # E1-E4的Freeman链码
+        centroid: Tuple[float, float],       # 整个残片的质心位置 (x, y)
+        contour_centroids: List[Tuple[float, float]],  # 每个轮廓段的质心
         semantic_vector: Optional[np.ndarray] = None,  # BERT语义向量
-        contour_segment: Optional[np.ndarray] = None,  # 原始轮廓段
-        image_id: Optional[int] = None        # 添加图像ID以区分来源
+        contours: Optional[List[np.ndarray]] = None,   # 所有轮廓段数据
+        image_id: Optional[int] = None        # 图像ID
     ):
         self.id = node_id
         self.freeman_codes = freeman_codes
         self.centroid = centroid
+        self.contour_centroids = contour_centroids
         self.semantic_vector = semantic_vector
-        self.contour_segment = contour_segment
+        self.contours = contours
         self.image_id = image_id
         
     def __repr__(self):
@@ -47,10 +49,11 @@ class Graph:
         self,
         freeman_codes: Dict[str, List[int]],
         centroid: Tuple[float, float],
+        contour_centroids: List[Tuple[float, float]],
         text: Optional[str] = None,
         bert_model: Optional[BertModel] = None,
         bert_tokenizer: Optional[BertTokenizer] = None,
-        contour_segment: Optional[np.ndarray] = None,
+        contours: Optional[List[np.ndarray]] = None,
         image_id: Optional[int] = None
     ) -> int:
         semantic_vector = None
@@ -62,8 +65,9 @@ class Graph:
             node_id=node_id,
             freeman_codes=freeman_codes,
             centroid=centroid,
+            contour_centroids=contour_centroids,
             semantic_vector=semantic_vector,
-            contour_segment=contour_segment,
+            contours=contours,
             image_id=image_id
         )
         self._next_node_id += 1
@@ -89,32 +93,25 @@ class Graph:
         plt.figure(figsize=(15, 8))
         
         if original_imgs is not None:
-            # 为每张图像创建子图
             unique_image_ids = set(node.image_id for node in self.nodes.values())
             for idx, img_id in enumerate(unique_image_ids, 1):
                 vis_img = cv2.cvtColor(original_imgs[img_id], cv2.COLOR_GRAY2BGR)
-                for node in self.nodes.values():
-                    if node.image_id == img_id and node.contour_segment is not None:
-                        color = (0, 255, 0) if node.id % 4 == 0 else \
-                                (255, 0, 0) if node.id % 4 == 1 else \
-                                (0, 0, 255) if node.id % 4 == 2 else \
+                node = next(n for n in self.nodes.values() if n.image_id == img_id)
+                if node.contours is not None:
+                    for i, contour in enumerate(node.contours):
+                        color = (0, 255, 0) if i == 0 else \
+                                (255, 0, 0) if i == 1 else \
+                                (0, 0, 255) if i == 2 else \
                                 (255, 255, 0)
-                        cv2.polylines(vis_img, [node.contour_segment], False, color, 2)
-                        cv2.circle(vis_img, (int(node.centroid[0]), int(node.centroid[1])), 5, (0, 0, 255), -1)
-                for edge in self.edges:
-                    node1 = self.nodes[edge.node1]
-                    node2 = self.nodes[edge.node2]
-                    if node1.image_id == img_id and node2.image_id == img_id:
-                        cv2.line(vis_img, 
-                                (int(node1.centroid[0]), int(node1.centroid[1])),
-                                (int(node2.centroid[0]), int(node2.centroid[1])),
-                                (255, 255, 255), 2)
+                        cv2.polylines(vis_img, [contour], False, color, 2)
+                        cv2.circle(vis_img, (int(node.contour_centroids[i][0]), 
+                                          int(node.contour_centroids[i][1])), 5, (255, 255, 255), -1)
+                    cv2.circle(vis_img, (int(node.centroid[0]), int(node.centroid[1])), 7, (0, 0, 255), -1)
                 
                 plt.subplot(len(unique_image_ids), 2, 2 * (idx - 1) + 1)
                 plt.imshow(vis_img)
                 plt.title(f'图像 {img_id} 图结构')
         
-        # 绘制整体拓扑图
         plt.subplot(1, 2, 2)
         for node in self.nodes.values():
             plt.scatter(node.centroid[0], node.centroid[1], s=100, label=f'Node {node.id} (Img {node.image_id})')
@@ -140,44 +137,58 @@ class GraphBuilder:
         image_paths: List[str],
         texts: Optional[List[str]] = None,
         bert_model: Optional[BertModel] = None,
-        bert_tokenizer: Optional[BertTokenizer] = None
+        bert_tokenizer: Optional[BertTokenizer] = None,
+        connect_all: bool = False  # 是否连接所有节点
     ) -> 'Graph':
         if texts is not None and len(texts) != len(image_paths):
             raise ValueError("文本数量必须与图像数量匹配")
         
+        node_ids = []
         for img_idx, image_path in enumerate(image_paths):
             text = texts[img_idx] if texts is not None else None
             segments, chain_codes = self._contour_processor.process_image(image_path)
             
-            centroids = []
+            # 计算每个轮廓段的质心
+            contour_centroids = []
             for seg in segments:
                 M = cv2.moments(seg)
-                cx = int(M['m10'] / (M['m00'] + 1e-5))  # 避免除以零
+                cx = int(M['m10'] / (M['m00'] + 1e-5))
                 cy = int(M['m01'] / (M['m00'] + 1e-5))
-                centroids.append((cx, cy))
+                contour_centroids.append((cx, cy))
             
-            node_ids = []
-            for i, (chain, centroid, seg) in enumerate(zip(chain_codes, centroids, segments)):
-                freeman_codes = {
-                    'E1': chain if i == 0 else [],
-                    'E2': chain if i == 1 else [],
-                    'E3': chain if i == 2 else [],
-                    'E4': chain if i == 3 else []
-                }
-                node_id = self.graph.add_node(
-                    freeman_codes=freeman_codes,
-                    centroid=centroid,
-                    text=text,
-                    bert_model=bert_model,
-                    bert_tokenizer=bert_tokenizer,
-                    contour_segment=seg,
-                    image_id=img_idx
-                )
-                node_ids.append(node_id)
+            # 计算整个残片的质心（基于所有轮廓点）
+            all_contour_points = np.vstack(segments)
+            M = cv2.moments(all_contour_points)
+            centroid_x = int(M['m10'] / (M['m00'] + 1e-5))
+            centroid_y = int(M['m01'] / (M['m00'] + 1e-5))
+            centroid = (centroid_x, centroid_y)
             
+            # 构建Freeman链码字典
+            freeman_codes = {
+                'E1': chain_codes[0],
+                'E2': chain_codes[1],
+                'E3': chain_codes[2],
+                'E4': chain_codes[3]
+            }
+            
+            # 添加节点
+            node_id = self.graph.add_node(
+                freeman_codes=freeman_codes,
+                centroid=centroid,
+                contour_centroids=contour_centroids,
+                text=text,
+                bert_model=bert_model,
+                bert_tokenizer=bert_tokenizer,
+                contours=segments,
+                image_id=img_idx
+            )
+            node_ids.append(node_id)
+        
+        # 可选：连接所有节点（形成完全图）
+        if connect_all:
             for i in range(len(node_ids)):
-                j = (i + 1) % len(node_ids)
-                self.graph.add_edge(node_ids[i], node_ids[j])
+                for j in range(i + 1, len(node_ids)):
+                    self.graph.add_edge(node_ids[i], node_ids[j])
         
         return self.graph
 
@@ -285,25 +296,24 @@ if __name__ == "__main__":
     
     builder = GraphBuilder()
     
-    # 输入多张图片
     image_paths = [
-        r"C:\Users\28489\Desktop\paired\7\3.jpg",
+        r"C:\Users\28489\Desktop\paired\7\1.jpg",
         r"C:\Users\28489\Desktop\paired\7\2.jpg",
-        r"C:\Users\28489\Desktop\paired\7\1.jpg"  # 可添加更多路径
+        r"C:\Users\28489\Desktop\paired\7\3.jpg"
     ]
-    texts = ["图像1描述", "图像2描述","图像3描述"]  # 可选，与图像数量匹配
+    texts = ["图像1描述", "图像2描述", "图像3描述"]
     
     try:
         graph = builder.build_from_images(
             image_paths=image_paths,
             texts=texts,
             bert_model=bert_model,
-            bert_tokenizer=bert_tokenizer
+            bert_tokenizer=bert_tokenizer,
+            connect_all=True  # 可选：连接所有节点
         )
         
         print(f"构建的图包含 {len(graph.nodes)} 个节点和 {len(graph.edges)} 条边")
         
-        # 加载原始图像用于可视化
         original_imgs = {i: cv2.imread(path, cv2.IMREAD_GRAYSCALE) for i, path in enumerate(image_paths)}
         graph.visualize(original_imgs)
         
