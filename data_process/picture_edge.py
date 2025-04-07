@@ -1,199 +1,311 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-
+from typing import Dict, List, Optional, Tuple, Union
+import torch
+from transformers import BertModel, BertTokenizer
 
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-def freeman_chain_code(contour, closed=True):
-    """改进的Freeman链码生成函数，支持开放和闭合轮廓"""
-    directions = [0, 1, 2, 3, 4, 5, 6, 7]
-    dx = [1, 1, 0, -1, -1, -1, 0, 1]
-    dy = [0, 1, 1, 1, 0, -1, -1, -1]
-    chain_code = []
-    n = len(contour)
-    
-    for i in range(n - 1 if not closed else n):
-        current = contour[i % n][0]
-        next_p = contour[(i + 1) % n][0]
-        delta = (next_p[0] - current[0], next_p[1] - current[1])
+class GraphNode:
+    def __init__(
+        self,
+        node_id: int,
+        freeman_codes: Dict[str, List[int]],  # 四个方向的Freeman编码，改为E1-E4
+        centroid: Tuple[float, float],       # 质心位置 (x, y)
+        semantic_vector: Optional[np.ndarray] = None,  # BERT语义向量
+        contour_segment: Optional[np.ndarray] = None,  # 原始轮廓段
+        image_id: Optional[int] = None        # 添加图像ID以区分来源
+    ):
+        self.id = node_id
+        self.freeman_codes = freeman_codes
+        self.centroid = centroid
+        self.semantic_vector = semantic_vector
+        self.contour_segment = contour_segment
+        self.image_id = image_id
         
-        found = False
-        for j, (ddx, ddy) in enumerate(zip(dx, dy)):
-            if delta == (ddx, ddy):
-                chain_code.append(j)
-                found = True
-                break
-        if not found:
-            raise ValueError(f"Invalid direction delta: {delta} at index {i}")
-    
-    return chain_code
+    def __repr__(self):
+        return f"GraphNode(id={self.id}, image_id={self.image_id}, centroid={self.centroid})"
 
-def preprocess(img):
-    """改进的预处理管道"""
-    blurred = cv2.GaussianBlur(img, (7, 7), 1.5)
-    thresh = cv2.adaptiveThreshold(blurred, 255, 
-                                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                  cv2.THRESH_BINARY_INV, 21, 6)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-    return closed
-
-def is_valid_contour(cnt, img_shape):
-    """轮廓有效性验证"""
-    area = cv2.contourArea(cnt)
-    if area < 500:
-        return False
-    
-    x, y, w, h = cv2.boundingRect(cnt)
-    if (x == 0 or y == 0 or 
-        x + w >= img_shape[1] - 1 or 
-        y + h >= img_shape[0] - 1):
-        return False
-    
-    solidity = area / (w * h)
-    return 0.3 < solidity < 0.9
-
-def reconstruct_from_code(chain, start_point, img_shape, closed=False):
-    """带路径验证的重建函数"""
-    dx = [1, 1, 0, -1, -1, -1, 0, 1]
-    dy = [0, 1, 1, 1, 0, -1, -1, -1]
-    
-    path = [start_point]
-    current = np.array(start_point)
-    
-    for code in chain:
-        step = np.array([dx[code], dy[code]])
-        next_point = current + step
+class GraphEdge:
+    def __init__(self, node1: int, node2: int, weight: Optional[float] = None):
+        self.node1 = node1
+        self.node2 = node2
+        self.weight = weight
         
-        next_point = np.clip(next_point, [0, 0], [img_shape[1]-1, img_shape[0]-1])
-        path.append(next_point.copy())
-        current = next_point
+    def __repr__(self):
+        return f"GraphEdge({self.node1} <-> {self.node2}, weight={self.weight})"
+
+class Graph:
+    def __init__(self):
+        self.nodes: Dict[int, GraphNode] = {}
+        self.edges: List[GraphEdge] = []
+        self._next_node_id = 0
+        
+    def add_node(
+        self,
+        freeman_codes: Dict[str, List[int]],
+        centroid: Tuple[float, float],
+        text: Optional[str] = None,
+        bert_model: Optional[BertModel] = None,
+        bert_tokenizer: Optional[BertTokenizer] = None,
+        contour_segment: Optional[np.ndarray] = None,
+        image_id: Optional[int] = None
+    ) -> int:
+        semantic_vector = None
+        if text is not None and bert_model is not None and bert_tokenizer is not None:
+            semantic_vector = self._generate_bert_vector(text, bert_model, bert_tokenizer)
+        
+        node_id = self._next_node_id
+        self.nodes[node_id] = GraphNode(
+            node_id=node_id,
+            freeman_codes=freeman_codes,
+            centroid=centroid,
+            semantic_vector=semantic_vector,
+            contour_segment=contour_segment,
+            image_id=image_id
+        )
+        self._next_node_id += 1
+        return node_id
     
-    return np.array(path, dtype=np.int32)
+    def add_edge(self, node1: int, node2: int, weight: Optional[float] = None):
+        if node1 not in self.nodes or node2 not in self.nodes:
+            raise ValueError("One or both nodes do not exist in the graph")
+        self.edges.append(GraphEdge(node1, node2, weight))
+    
+    def _generate_bert_vector(
+        self,
+        text: str,
+        bert_model: BertModel,
+        bert_tokenizer: BertTokenizer
+    ) -> np.ndarray:
+        inputs = bert_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        with torch.no_grad():
+            outputs = bert_model(**inputs)
+        return outputs.last_hidden_state[:, 0, :].numpy()
+    
+    def visualize(self, original_imgs: Dict[int, np.ndarray] = None):
+        plt.figure(figsize=(15, 8))
+        
+        if original_imgs is not None:
+            # 为每张图像创建子图
+            unique_image_ids = set(node.image_id for node in self.nodes.values())
+            for idx, img_id in enumerate(unique_image_ids, 1):
+                vis_img = cv2.cvtColor(original_imgs[img_id], cv2.COLOR_GRAY2BGR)
+                for node in self.nodes.values():
+                    if node.image_id == img_id and node.contour_segment is not None:
+                        color = (0, 255, 0) if node.id % 4 == 0 else \
+                                (255, 0, 0) if node.id % 4 == 1 else \
+                                (0, 0, 255) if node.id % 4 == 2 else \
+                                (255, 255, 0)
+                        cv2.polylines(vis_img, [node.contour_segment], False, color, 2)
+                        cv2.circle(vis_img, (int(node.centroid[0]), int(node.centroid[1])), 5, (0, 0, 255), -1)
+                for edge in self.edges:
+                    node1 = self.nodes[edge.node1]
+                    node2 = self.nodes[edge.node2]
+                    if node1.image_id == img_id and node2.image_id == img_id:
+                        cv2.line(vis_img, 
+                                (int(node1.centroid[0]), int(node1.centroid[1])),
+                                (int(node2.centroid[0]), int(node2.centroid[1])),
+                                (255, 255, 255), 2)
+                
+                plt.subplot(len(unique_image_ids), 2, 2 * (idx - 1) + 1)
+                plt.imshow(vis_img)
+                plt.title(f'图像 {img_id} 图结构')
+        
+        # 绘制整体拓扑图
+        plt.subplot(1, 2, 2)
+        for node in self.nodes.values():
+            plt.scatter(node.centroid[0], node.centroid[1], s=100, label=f'Node {node.id} (Img {node.image_id})')
+        for edge in self.edges:
+            node1 = self.nodes[edge.node1]
+            node2 = self.nodes[edge.node2]
+            plt.plot([node1.centroid[0], node2.centroid[0]], 
+                    [node1.centroid[1], node2.centroid[1]], 'k-')
+        plt.title('整体图关系拓扑')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
 
-def process_contour_to_segments(image_path):
-    """
-    处理图像轮廓并分割为四个部分
-    参数:
-        image_path (str): 图像文件路径
-    返回:
-        segments (list): 分割后的四个轮廓段
-        chain_codes (list): 每个段的 Freeman 链码
-    """
-    # 图像读取
-    original = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if original is None:
-        raise ValueError(f"无法读取图像: {image_path}")
+class GraphBuilder:
+    def __init__(self):
+        self.graph = Graph()
+        self._contour_processor = ContourProcessor()
+    
+    def build_from_images(
+        self,
+        image_paths: List[str],
+        texts: Optional[List[str]] = None,
+        bert_model: Optional[BertModel] = None,
+        bert_tokenizer: Optional[BertTokenizer] = None
+    ) -> 'Graph':
+        if texts is not None and len(texts) != len(image_paths):
+            raise ValueError("文本数量必须与图像数量匹配")
+        
+        for img_idx, image_path in enumerate(image_paths):
+            text = texts[img_idx] if texts is not None else None
+            segments, chain_codes = self._contour_processor.process_image(image_path)
+            
+            centroids = []
+            for seg in segments:
+                M = cv2.moments(seg)
+                cx = int(M['m10'] / (M['m00'] + 1e-5))  # 避免除以零
+                cy = int(M['m01'] / (M['m00'] + 1e-5))
+                centroids.append((cx, cy))
+            
+            node_ids = []
+            for i, (chain, centroid, seg) in enumerate(zip(chain_codes, centroids, segments)):
+                freeman_codes = {
+                    'E1': chain if i == 0 else [],
+                    'E2': chain if i == 1 else [],
+                    'E3': chain if i == 2 else [],
+                    'E4': chain if i == 3 else []
+                }
+                node_id = self.graph.add_node(
+                    freeman_codes=freeman_codes,
+                    centroid=centroid,
+                    text=text,
+                    bert_model=bert_model,
+                    bert_tokenizer=bert_tokenizer,
+                    contour_segment=seg,
+                    image_id=img_idx
+                )
+                node_ids.append(node_id)
+            
+            for i in range(len(node_ids)):
+                j = (i + 1) % len(node_ids)
+                self.graph.add_edge(node_ids[i], node_ids[j])
+        
+        return self.graph
 
-    # 预处理
-    processed = preprocess(original)
+class ContourProcessor:
+    @staticmethod
+    def freeman_chain_code(contour, closed=True):
+        directions = [0, 1, 2, 3, 4, 5, 6, 7]
+        dx = [1, 1, 0, -1, -1, -1, 0, 1]
+        dy = [0, 1, 1, 1, 0, -1, -1, -1]
+        chain_code = []
+        n = len(contour)
+        
+        for i in range(n - 1 if not closed else n):
+            current = contour[i % n][0]
+            next_p = contour[(i + 1) % n][0]
+            delta = (next_p[0] - current[0], next_p[1] - current[1])
+            
+            for j, (ddx, ddy) in enumerate(zip(dx, dy)):
+                if delta == (ddx, ddy):
+                    chain_code.append(j)
+                    break
+            else:
+                raise ValueError(f"Invalid direction delta: {delta} at index {i}")
+        
+        return chain_code
+    
+    @staticmethod
+    def preprocess(img):
+        blurred = cv2.GaussianBlur(img, (7, 7), 1.5)
+        thresh = cv2.adaptiveThreshold(blurred, 255, 
+                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY_INV, 21, 6)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
+        return closed
+    
+    @staticmethod
+    def is_valid_contour(cnt, img_shape):
+        area = cv2.contourArea(cnt)
+        if area < 500:
+            return False
+        
+        x, y, w, h = cv2.boundingRect(cnt)
+        if (x == 0 or y == 0 or 
+            x + w >= img_shape[1] - 1 or 
+            y + h >= img_shape[0] - 1):
+            return False
+        
+        solidity = area / (w * h)
+        return 0.3 < solidity < 0.9
+    
+    def process_image(self, image_path: str):
+        original = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if original is None:
+            raise ValueError(f"无法读取图像: {image_path}")
 
-    # 轮廓检测
-    contours, _ = cv2.findContours(processed, 
-                                  cv2.RETR_EXTERNAL, 
-                                  cv2.CHAIN_APPROX_NONE)
+        processed = self.preprocess(original)
+        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        valid_contours = [cnt for cnt in contours if self.is_valid_contour(cnt, original.shape)]
+        
+        if not valid_contours:
+            raise ValueError("未找到有效轮廓，请调整预处理参数")
 
-    # 筛选有效轮廓
-    valid_contours = [cnt for cnt in contours if is_valid_contour(cnt, original.shape)]
-    if not valid_contours:
-        raise ValueError("未找到有效轮廓，请调整预处理参数")
-
-    # 选择最佳轮廓
-    best_contour = max(valid_contours, key=lambda c: cv2.contourArea(c))
-
-    # 轮廓近似为四边形
-    perimeter = cv2.arcLength(best_contour, True)
-    epsilon = 0.01 * perimeter
-    approx = cv2.approxPolyDP(best_contour, epsilon, True)
-
-    # 调整 epsilon 以确保恰好 4 个点
-    for _ in range(20):
-        if len(approx) == 4:
-            break
-        elif len(approx) > 4:
-            epsilon *= 1.1
-        else:
-            epsilon *= 0.9
+        best_contour = max(valid_contours, key=lambda c: cv2.contourArea(c))
+        perimeter = cv2.arcLength(best_contour, True)
+        epsilon = 0.01 * perimeter
         approx = cv2.approxPolyDP(best_contour, epsilon, True)
-    else:
-        raise ValueError("无法近似为恰好 4 个点，请调整 epsilon 或预处理参数")
 
-    # 找到近似点在原始轮廓中的索引
-    contour_points = best_contour.reshape(-1, 2)
-    indices = []
-    for p in approx.reshape(-1, 2):
-        distances = np.sum((contour_points - p)**2, axis=1)
-        idx = np.argmin(distances)
-        indices.append(idx)
+        for _ in range(20):
+            if len(approx) == 4:
+                break
+            elif len(approx) > 4:
+                epsilon *= 1.1
+            else:
+                epsilon *= 0.9
+            approx = cv2.approxPolyDP(best_contour, epsilon, True)
+        else:
+            raise ValueError("无法近似为恰好4个点")
 
-    # 确保索引按顺时针顺序排列
-    indices.sort()
-    if len(set(indices)) != 4:
-        raise ValueError("近似点映射到重复索引，请减小 epsilon")
+        contour_points = best_contour.reshape(-1, 2)
+        indices = []
+        for p in approx.reshape(-1, 2):
+            distances = np.sum((contour_points - p)**2, axis=1)
+            idx = np.argmin(distances)
+            indices.append(idx)
+        indices.sort()
 
-    # 分割轮廓为四部分
-    seg1 = best_contour[indices[0]:indices[1]+1]
-    seg2 = best_contour[indices[1]:indices[2]+1]
-    seg3 = best_contour[indices[2]:indices[3]+1]
-    seg4 = np.vstack((best_contour[indices[3]:], best_contour[:indices[0]+1]))
+        if len(set(indices)) != 4:
+            raise ValueError("近似点映射到重复索引")
 
-    segments = [seg1, seg2, seg3, seg4]
+        seg1 = best_contour[indices[0]:indices[1]+1]
+        seg2 = best_contour[indices[1]:indices[2]+1]
+        seg3 = best_contour[indices[2]:indices[3]+1]
+        seg4 = np.vstack((best_contour[indices[3]:], best_contour[:indices[0]+1]))
 
-    # 为每个段生成 Freeman 链码
-    chain_codes = [freeman_chain_code(seg, closed=False) for seg in segments]
+        segments = [seg1, seg2, seg3, seg4]
+        chain_codes = [self.freeman_chain_code(seg, closed=False) for seg in segments]
+        
+        return segments, chain_codes
 
-    # 重建每段
-    start_points = [tuple(seg[0][0]) for seg in segments]
-    reconstructed_segs = [
-        reconstruct_from_code(chain_codes[i], start_points[i], original.shape, closed=False)
-        for i in range(4)
+# 示例用法
+if __name__ == "__main__":
+    bert_model = None
+    bert_tokenizer = None
+    
+    builder = GraphBuilder()
+    
+    # 输入多张图片
+    image_paths = [
+        r"C:\Users\28489\Desktop\paired\7\3.jpg",
+        r"C:\Users\28489\Desktop\paired\7\2.jpg",
+        r"C:\Users\28489\Desktop\paired\7\1.jpg"  # 可添加更多路径
     ]
-
-    # 可视化对比
-    plt.figure(figsize=(15, 10))
-
-    plt.subplot(231)
-    plt.imshow(original, cmap='gray')
-    plt.title('原始图像')
-
-    plt.subplot(232)
-    plt.imshow(processed, cmap='gray')
-    plt.title('预处理结果')
-
-    contour_img = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
-    colors = [(0,255,0), (255,0,0), (0,0,255), (255,255,0)]  # 绿、蓝、红、黄
-    for seg, color in zip(segments, colors):
-        cv2.polylines(contour_img, [seg], isClosed=False, color=color, thickness=2)
-    plt.subplot(233)
-    plt.imshow(contour_img)
-    plt.title('检测到的轮廓 (分段)')
-
-    recon_img = np.zeros_like(contour_img)
-    for seg, color in zip(reconstructed_segs, colors):
-        cv2.polylines(recon_img, [seg], isClosed=False, color=color, thickness=2)
-    plt.subplot(234)
-    plt.imshow(recon_img)
-    plt.title('链码重建轮廓 (分段)')
-
-    overlay = contour_img.copy()
-    for seg, color in zip(reconstructed_segs, colors):
-        cv2.polylines(overlay, [seg], isClosed=False, color=(255-color[0], 255-color[1], 255-color[2]), thickness=2)
-    plt.subplot(235)
-    plt.imshow(overlay)
-    plt.title('叠加对比 (实:原始，虚:重建)')
-
-    diff = cv2.absdiff(contour_img, recon_img)
-    plt.subplot(236)
-    plt.imshow(diff, cmap='jet')
-    plt.title('差异热力图')
-
-    plt.tight_layout()
-    plt.show()
-
-    # 打印链码供参考
-    for i, chain in enumerate(chain_codes):
-        print(f"Segment {i+1} Chain Code: {chain[:10]}... (length: {len(chain)})")
-
-    return segments, chain_codes
+    texts = ["图像1描述", "图像2描述","图像3描述"]  # 可选，与图像数量匹配
+    
+    try:
+        graph = builder.build_from_images(
+            image_paths=image_paths,
+            texts=texts,
+            bert_model=bert_model,
+            bert_tokenizer=bert_tokenizer
+        )
+        
+        print(f"构建的图包含 {len(graph.nodes)} 个节点和 {len(graph.edges)} 条边")
+        
+        # 加载原始图像用于可视化
+        original_imgs = {i: cv2.imread(path, cv2.IMREAD_GRAYSCALE) for i, path in enumerate(image_paths)}
+        graph.visualize(original_imgs)
+        
+    except Exception as e:
+        print(f"处理图像时出错: {str(e)}")
