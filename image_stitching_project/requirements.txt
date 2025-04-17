@@ -1,1 +1,1 @@
-opencv-python>=4.5.0 numpy>=1.19.0 matplotlib>=3.3.0 torch>=1.8.0 transformers>=4.6.0 hmmlearn>=0.2.5 scipy>=1.5.0
+opencv-contrib-python&gt;=4.5.0 numpy&gt;=1.19.0 matplotlib&gt;=3.3.0 torch&gt;=2.0.0+cu118 transformers&gt;=4.6.0 hmmlearn&gt;=0.2.5 scipy&gt;=1.5.0
