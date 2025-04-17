@@ -10,11 +10,10 @@ plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 class Graph:
-    def __init__(self, device: torch.device):
+    def __init__(self):
         self.nodes: Dict[int, GraphNode] = {}
         self.edges: List[GraphEdge] = []
         self._next_node_id = 0
-        self.device = device
         
     def add_node(self, freeman_codes, centroid, contour_centroids, text=None, bert_model=None, bert_tokenizer=None, contours=None, image_id=None, original_image=None):
         semantic_vector = None
@@ -41,12 +40,10 @@ class Graph:
         self.edges.append(GraphEdge(node1, node2, weight))
     
     def _generate_bert_vector(self, text, bert_model, bert_tokenizer):
-        bert_model = bert_model.to(self.device)
         inputs = bert_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-        inputs = {key: val.to(self.device) for key, val in inputs.items()}
         with torch.no_grad():
             outputs = bert_model(**inputs)
-        return outputs.last_hidden_state[:, 0, :].cpu().numpy()  # 返回 CPU 上的 NumPy 数组
+        return outputs.last_hidden_state[:, 0, :].numpy()
     
     def visualize(self, stitched_image: Optional[np.ndarray] = None):
         plt.figure(figsize=(15, 10))

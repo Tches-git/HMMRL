@@ -1,30 +1,18 @@
 import cv2
 import numpy as np
-import torch
 from typing import List, Tuple
 
 class ContourProcessor:
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.cuda_available = cv2.cuda.getCudaEnabledDeviceCount() > 0
-
     def process_image(self, image_path: str) -> Tuple[List[np.ndarray], List[List[int]]]:
         try:
-            # 读取图像
             original = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
             if original is None:
                 raise ValueError(f"无法读取图像: {image_path}")
 
-            # 使用 GPU 或 CPU 进行预处理
-            if self.cuda_available:
-                processed = self.preprocess_cuda(original)
-            else:
-                processed = self.preprocess_cpu(original)
-            
+            processed = self.preprocess(original)
             if processed is None:
                 raise ValueError("图像预处理失败")
             
-            # 轮廓检测（GPU 或 CPU）
             contours, hierarchy = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             if not contours:
                 raise ValueError("未找到任何轮廓")
@@ -76,9 +64,10 @@ class ContourProcessor:
             print(f"图像处理错误: {str(e)}")
             raise
 
-    def preprocess_cpu(self, img):
+    def preprocess(self, img):
         if img is None:
             return None
+            
         blurred = cv2.GaussianBlur(img, (7, 7), 1.5)
         thresh = cv2.adaptiveThreshold(
             blurred, 
@@ -88,33 +77,6 @@ class ContourProcessor:
             21, 
             6
         )
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-        return closed
-
-    def preprocess_cuda(self, img):
-        if img is None:
-            return None
-        # 上传图像到 GPU
-        gpu_img = cv2.cuda_GpuMat()
-        gpu_img.upload(img)
-        
-        # GPU 高斯模糊
-        gpu_blur = cv2.cuda.createGaussianFilter(cv2.CV_8U, cv2.CV_8U, (7, 7), 1.5)
-        gpu_blurred = gpu_blur.apply(gpu_img)
-        
-        # 自适应阈值（需要下载到 CPU，因为 cv2.cuda 没有直接支持）
-        blurred = gpu_blurred.download()
-        thresh = cv2.adaptiveThreshold(
-            blurred, 
-            255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY_INV, 
-            21, 
-            6
-        )
-        
-        # 形态学操作
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
         closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
         return closed
@@ -161,46 +123,42 @@ class ContourProcessor:
             for i in range(n_points)
         ])
         
-        # 转换为 PyTorch 张量并移到 GPU
-        sampled_points_torch = torch.from_numpy(sampled_points).float().to(self.device)
-        
         shape_contexts = []
         for i in range(n_points):
-            diff = sampled_points_torch - sampled_points_torch[i]
-            distances = torch.sqrt(torch.sum(diff**2, dim=1))
-            angles = torch.atan2(diff[:, 1], diff[:, 0])
+            diff = sampled_points - sampled_points[i]
+            distances = np.sqrt(np.sum(diff**2, axis=1))
+            angles = np.arctan2(diff[:, 1], diff[:, 0])
             
-            angles[angles < 0] += 2 * torch.pi
+            angles[angles < 0] += 2 * np.pi
             
             max_dist = distances.max()
             min_dist = distances[distances > 0].min()
-            log_r_bins = torch.logspace(torch.log10(min_dist), torch.log10(max_dist), n_bins_r, device=self.device)
-            theta_bins = torch.linspace(0, 2*torch.pi, n_bins_theta+1, device=self.device)
+            log_r_bins = np.logspace(np.log10(min_dist), np.log10(max_dist), n_bins_r)
+            theta_bins = np.linspace(0, 2*np.pi, n_bins_theta+1)
             
-            hist = torch.histogram2d(
+            hist, _, _ = np.histogram2d(
                 distances, angles, 
                 bins=[log_r_bins, theta_bins]
-            )[0]
-            shape_contexts.append(hist.flatten().cpu().numpy())
+            )
+            shape_contexts.append(hist.flatten())
             
         return np.array(shape_contexts)
 
     def dtw_distance(self, seq1, seq2):
-        seq1 = torch.from_numpy(seq1).float().to(self.device)
-        seq2 = torch.from_numpy(seq2).float().to(self.device)
-        
         n, m = len(seq1), len(seq2)
-        dtw_matrix = torch.full((n + 1, m + 1), float('inf'), device=self.device)
+        dtw_matrix = np.inf * np.ones((n + 1, m + 1))
         dtw_matrix[0, 0] = 0
         
         for i in range(1, n + 1):
             for j in range(1, m + 1):
-                cost = torch.norm(seq1[i-1] - seq2[j-1])
-                dtw_matrix[i, j] = cost + torch.min(
-                    torch.tensor([dtw_matrix[i-1, j], dtw_matrix[i, j-1], dtw_matrix[i-1, j-1]], device=self.device)
+                cost = np.linalg.norm(seq1[i-1] - seq2[j-1])
+                dtw_matrix[i, j] = cost + min(
+                    dtw_matrix[i-1, j],
+                    dtw_matrix[i, j-1],
+                    dtw_matrix[i-1, j-1]
                 )
         
-        return dtw_matrix[n, m].cpu().numpy()
+        return dtw_matrix[n, m]
 
     def evaluate_contour_match(self, contour1, contour2):
         try:

@@ -1,31 +1,25 @@
 import tkinter as tk
 from tkinter import filedialog
 from src.graph_builder import GraphBuilder
-import torch
 
 def select_image_files():
     """使用文件对话框让用户选择多张图片"""
     root = tk.Tk()
-    root.withdraw()
+    root.withdraw()  # 隐藏主窗口，仅显示文件对话框
     filetypes = [("Image files", "*.jpg *.jpeg *.png"), ("All files", "*.*")]
     files = filedialog.askopenfilenames(
         title="选择图像文件",
         filetypes=filetypes,
-        initialdir="C:\\Users\\28489\\Desktop\\paired\\31"
+        initialdir="C:\\Users\\28489\\Desktop\\paired\\31"  # 默认目录，可根据需要修改
     )
-    root.destroy()
+    root.destroy()  # 关闭 Tkinter 实例
     return list(files)
 
 def main():
-    # 检测 GPU 可用性
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
-
     bert_model = None
     bert_tokenizer = None
     
-    # 传递设备参数
-    builder = GraphBuilder(device=device)
+    builder = GraphBuilder()
     
     # 让用户选择图像文件
     image_paths = select_image_files()

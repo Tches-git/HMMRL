@@ -1,17 +1,15 @@
 import numpy as np
 import cv2
-import torch
 from hmmlearn import hmm
 from .graph import Graph
 from .contour_processor import ContourProcessor
 from .rl_optimizer import RLOptimizer
 
 class GraphBuilder:
-    def __init__(self, device: torch.device):
-        self.graph = Graph(device=device)
-        self._contour_processor = ContourProcessor(device=device)
+    def __init__(self):
+        self.graph = Graph()
+        self._contour_processor = ContourProcessor()
         self.rl_optimizer = None
-        self.device = device
 
     def build_from_images(self, image_paths, texts=None, bert_model=None, bert_tokenizer=None):
         if texts and len(texts) != len(image_paths):
@@ -33,7 +31,7 @@ class GraphBuilder:
         enhanced_features = self._compute_enhanced_features(node_ids)
         n_states = len(node_ids)
         
-        self.rl_optimizer = RLOptimizer(n_states, device=self.device)
+        self.rl_optimizer = RLOptimizer(n_states)
         
         best_score = float('-inf')
         best_sequence = None
@@ -133,12 +131,12 @@ class GraphBuilder:
 
     def _compute_enhanced_features(self, node_ids):
         n_nodes = len(node_ids)
-        features = torch.zeros((n_nodes, 8), device=self.device)
+        features = np.zeros((n_nodes, 8))
         
         for i, node1_id in enumerate(node_ids):
             node1 = self.graph.nodes[node1_id]
-            shape_scores = torch.zeros(4, device=self.device)
-            geometric_scores = torch.zeros(4, device=self.device)
+            shape_scores = np.zeros(4)
+            geometric_scores = np.zeros(4)
             
             for j, node2_id in enumerate(node_ids):
                 if i == j:
@@ -153,12 +151,12 @@ class GraphBuilder:
                     shape_score = self._contour_processor.evaluate_contour_match(contour1, contour2)
                     geo_score = self._compute_geometric_compatibility(contour1, contour2)
                     
-                    shape_scores[edge_idx] = max(shape_scores[edge_idx], torch.tensor(shape_score, device=self.device))
-                    geometric_scores[edge_idx] = max(geometric_scores[edge_idx], torch.tensor(geo_score, device=self.device))
+                    shape_scores[edge_idx] = max(shape_scores[edge_idx], shape_score)
+                    geometric_scores[edge_idx] = max(geometric_scores[edge_idx], geo_score)
             
-            features[i] = torch.cat([shape_scores, geometric_scores])
+            features[i] = np.concatenate([shape_scores, geometric_scores])
         
-        return features.cpu().numpy()  # 返回 CPU 上的 NumPy 数组供 hmmlearn 使用
+        return features
 
     def _compute_geometric_compatibility(self, contour1, contour2):
         try:
@@ -366,121 +364,99 @@ class GraphBuilder:
             return 0.0
 
     def _stitch_images_based_on_sequence(self, node_ids, sequence):
-        if not node_ids or not sequence:
-            print("错误: node_ids 或 sequence 为空")
-            return np.zeros((100, 100), dtype=np.uint8)  # 返回空画布
-
-        try:
-            sorted_indices = np.argsort(sequence)
-            sorted_nodes = [self.graph.nodes[node_ids[i]] for i in sorted_indices]
+        sorted_indices = np.argsort(sequence)
+        sorted_nodes = [self.graph.nodes[node_ids[i]] for i in sorted_indices]
+        
+        max_canvas_size = 5000
+        used_positions = np.zeros((max_canvas_size, max_canvas_size), dtype=bool)
+        offsets = [(max_canvas_size//4, max_canvas_size//4)]
+        
+        first_node = sorted_nodes[0]
+        first_mask = np.zeros_like(first_node.original_image)
+        cv2.drawContours(first_mask, [np.vstack(first_node.contours)], -1, (255), thickness=cv2.FILLED)
+        h, w = first_mask.shape
+        x_start, y_start = offsets[0]
+        used_positions[x_start:x_start+h, y_start:y_start+w] = (first_mask > 0)
+        
+        for i in range(1, len(sorted_nodes)):
+            prev_node = sorted_nodes[i-1]
+            curr_node = sorted_nodes[i]
             
-            max_canvas_size = 5000
-            used_positions = np.zeros((max_canvas_size, max_canvas_size), dtype=bool)
-            offsets = [(max_canvas_size//4, max_canvas_size//4)]
+            best_edge = 0
+            best_score = 0
+            best_offset = None
+            max_score = float('-inf')
             
-            # 处理第一个节点
-            first_node = sorted_nodes[0]
-            first_mask = np.zeros_like(first_node.original_image)
-            cv2.drawContours(first_mask, [np.vstack(first_node.contours)], -1, (255), thickness=cv2.FILLED)
-            h, w = first_mask.shape
-            x_start, y_start = offsets[0]
-            used_positions[x_start:x_start+h, y_start:y_start+w] = (first_mask > 0)
-            
-            # 处理后续节点
-            for i in range(1, len(sorted_nodes)):
-                prev_node = sorted_nodes[i-1]
-                curr_node = sorted_nodes[i]
+            for edge_idx in range(4):
+                contour1 = prev_node.contours[edge_idx]
+                contour2 = curr_node.contours[(edge_idx + 2) % 4]
+                score = self._contour_processor.evaluate_contour_match(contour1, contour2)
                 
-                best_edge = 0
-                best_score = 0
-                best_offset = None
-                max_score = float('-inf')
-                
-                for edge_idx in range(4):
-                    contour1 = prev_node.contours[edge_idx]
-                    contour2 = curr_node.contours[(edge_idx + 2) % 4]
-                    score = self._contour_processor.evaluate_contour_match(contour1, contour2)
+                if score > best_score:
+                    prev_offset = offsets[-1]
+                    contour_length = self._get_contour_length(prev_node.contours[edge_idx])
                     
-                    if score > best_score:
-                        prev_offset = offsets[-1]
-                        contour_length = self._get_contour_length(prev_node.contours[edge_idx])
-                        
-                        if edge_idx == 0:
-                            new_offset = (prev_offset[0], prev_offset[1] + contour_length)
-                        elif edge_idx == 1:
-                            new_offset = (prev_offset[0] + contour_length, prev_offset[1])
-                        elif edge_idx == 2:
-                            new_offset = (prev_offset[0], prev_offset[1] - contour_length)
-                        else:
-                            new_offset = (prev_offset[0] - contour_length, prev_offset[1])
-                        
-                        x_pos, y_pos = new_offset
-                        curr_mask = np.zeros_like(curr_node.original_image)
-                        cv2.drawContours(curr_mask, [np.vstack(curr_node.contours)], -1, (255), thickness=cv2.FILLED)
-                        h, w = curr_mask.shape
-                        
-                        if (0 <= x_pos < max_canvas_size-h and 
-                            0 <= y_pos < max_canvas_size-w):
-                            region = used_positions[x_pos:x_pos+h, y_pos:y_pos+w]
-                            if not np.any(region & (curr_mask > 0)):
-                                if score > max_score:
-                                    max_score = score
-                                    best_score = score
-                                    best_edge = edge_idx
-                                    best_offset = new_offset
-                
-                if best_offset is None:
-                    best_offset = self._find_nearest_valid_position(
-                        curr_node, offsets[-1], used_positions, max_canvas_size
-                    )
-                
-                x_pos, y_pos = best_offset
-                curr_mask = np.zeros_like(curr_node.original_image)
-                cv2.drawContours(curr_mask, [np.vstack(curr_node.contours)], -1, (255), thickness=cv2.FILLED)
-                h, w = curr_mask.shape
-                used_positions[x_pos:x_pos+h, y_pos:y_pos+w] |= (curr_mask > 0)
-                offsets.append(best_offset)
+                    if edge_idx == 0:
+                        new_offset = (prev_offset[0], prev_offset[1] + contour_length)
+                    elif edge_idx == 1:
+                        new_offset = (prev_offset[0] + contour_length, prev_offset[1])
+                    elif edge_idx == 2:
+                        new_offset = (prev_offset[0], prev_offset[1] - contour_length)
+                    else:
+                        new_offset = (prev_offset[0] - contour_length, prev_offset[1])
+                    
+                    x_pos, y_pos = new_offset
+                    curr_mask = np.zeros_like(curr_node.original_image)
+                    cv2.drawContours(curr_mask, [np.vstack(curr_node.contours)], -1, (255), thickness=cv2.FILLED)
+                    h, w = curr_mask.shape
+                    
+                    if (0 <= x_pos < max_canvas_size-h and 
+                        0 <= y_pos < max_canvas_size-w):
+                        region = used_positions[x_pos:x_pos+h, y_pos:y_pos+w]
+                        if not np.any(region & (curr_mask > 0)):
+                            if score > max_score:
+                                max_score = score
+                                best_score = score
+                                best_edge = edge_idx
+                                best_offset = new_offset
             
-            # 计算画布尺寸
-            if len(offsets) < 1:
-                print("错误: offsets 列表为空")
-                return np.zeros((100, 100), dtype=np.uint8)
+            if best_offset is None:
+                best_offset = self._find_nearest_valid_position(
+                    curr_node, offsets[-1], used_positions, max_canvas_size
+                )
             
-            min_x = min(offset[0] for offset in offsets)
-            min_y = min(offset[1] for offset in offsets)
-            max_x = max(offset[0] + node.original_image.shape[0] for offset, node in zip(offsets, sorted_nodes))
-            max_y = max(offset[1] + node.original_image.shape[1] for offset, node in zip(offsets, sorted_nodes))
+            x_pos, y_pos = best_offset
+            curr_mask = np.zeros_like(curr_node.original_image)
+            cv2.drawContours(curr_mask, [np.vstack(curr_node.contours)], -1, (255), thickness=cv2.FILLED)
+            h, w = curr_mask.shape
+            used_positions[x_pos:x_pos+h, y_pos:y_pos+w] |= (curr_mask > 0)
+            offsets.append(best_offset)
+        
+        min_x = min(offset[0] for offset in offsets)
+        min_y = min(offset[1] for offset in offsets)
+        max_x = max(offset[0] + node.original_image.shape[0] for offset, node in zip(offsets, sorted_nodes))
+        max_y = max(offset[1] + node.original_image.shape[1] for offset, node in zip(offsets, sorted_nodes))
+        
+        canvas_width = int(max_y - min_y)
+        canvas_height = int(max_x - min_x)
+        stitched = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+        
+        for node, offset in zip(sorted_nodes, offsets):
+            x_pos = int(offset[0] - min_x)
+            y_pos = int(offset[1] - min_y)
             
-            canvas_width = int(max_y - min_y)
-            canvas_height = int(max_x - min_x)
+            mask = np.zeros_like(node.original_image)
+            cv2.drawContours(mask, [np.vstack(node.contours)], -1, (255), thickness=cv2.FILLED)
+            fragment = cv2.bitwise_and(node.original_image, node.original_image, mask=mask)
             
-            if canvas_width <= 0 or canvas_height <= 0:
-                print("错误: 画布尺寸无效")
-                return np.zeros((100, 100), dtype=np.uint8)
+            h, w = fragment.shape
+            x_end = min(x_pos + h, canvas_height)
+            y_end = min(y_pos + w, canvas_width)
             
-            stitched = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
-            
-            # 将节点图像拼接至画布
-            for node, offset in zip(sorted_nodes, offsets):
-                x_pos = int(offset[0] - min_x)
-                y_pos = int(offset[1] - min_y)
-                
-                mask = np.zeros_like(node.original_image)
-                cv2.drawContours(mask, [np.vstack(node.contours)], -1, (255), thickness=cv2.FILLED)
-                fragment = cv2.bitwise_and(node.original_image, node.original_image, mask=mask)
-                
-                h, w = fragment.shape
-                x_end = min(x_pos + h, canvas_height)
-                y_end = min(y_pos + w, canvas_width)
-                
-                if x_pos >= 0 and y_pos >= 0 and x_end <= canvas_height and y_end <= canvas_width:
-                    stitched[x_pos:x_end, y_pos:y_end] = fragment[:x_end-x_pos, :y_end-y_pos]
-            
-            return stitched
-
-        except Exception as e:
-            print(f"图像拼接错误: {str(e)}")
-            return np.zeros((100, 100), dtype=np.uint8)
+            if x_pos >= 0 and y_pos >= 0 and x_end <= canvas_height and y_end <= canvas_width:
+                stitched[x_pos:x_end, y_pos:y_end] = fragment[:x_end-x_pos, :y_end-y_pos]
+        
+        return stitched
 
     def _find_nearest_valid_position(self, node, base_offset, used_positions, max_size):
         directions = [(0, 1), (1, 0), (0, -1), (-1, 0)]
